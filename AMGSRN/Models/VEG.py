@@ -25,7 +25,7 @@ class VEG(nn.Module):
         global_max = max(xmax, ymax, zmax)
         mesh.translate(np.array([-global_min, -global_min, -global_min]), inplace=True)
         mesh.scale(1.0/(global_max - global_min), inplace=True)
-        self.tet_mesh = mesh.extract_surface().triangulate().clean()
+        self.mesh = mesh
 
         plydata = PlyData.read(os.path.join(opt['path_to_load'], opt["ply_file"]))
         print(
@@ -165,11 +165,9 @@ class VEG(nn.Module):
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = (x + 1) / 2
-        pts = pv.PolyData(x.cpu().numpy())
-        enclosed = pts.select_interior_points(self.tet_mesh)
-        inside = torch.from_numpy(
-            enclosed.point_data["selected_points"].astype(bool)
-        ).to(x.device)
+        probe_mesh = pv.PolyData(x.cpu().numpy())
+        probed = probe_mesh.sample(self.mesh)
+        valid_mask = probed['vtkValidPointMask'].astype(bool)
         
         self._rasterizer.build_bvh(x, False, False)
         means3D = self.get_xyz
@@ -186,6 +184,7 @@ class VEG(nn.Module):
             weights=weights,
             debug=False
         )
+        print(y.shape)
         print(torch.count_nonzero(y < 0))
-        y[~inside] = 0
+        y[~valid_mask] = 0
         return y.reshape(-1, 1)
