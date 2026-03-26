@@ -298,6 +298,7 @@ def find_optimal_error_bound(model, opt, device, max_psnr_drop=0.1, sample_size=
 def load_model(opt, device, path_to_load = None):
     if path_to_load is None:
         path_to_load = os.path.join(save_folder, opt["save_name"])
+    opt['path_to_load'] = path_to_load
     
     try:
         import tinycudann
@@ -305,7 +306,7 @@ def load_model(opt, device, path_to_load = None):
     except ImportError:
         tcnn_installed = False
 
-    if(not opt['ensemble']):
+    if(not opt['ensemble']) and not (opt['model'] == 'VEG' or opt['model'] == 'VEGS'):
         model = create_model(opt)
         if not opt['save_with_compression']:
             model.load_state_dict(torch.load(os.path.join(path_to_load, "model.ckpt"))['state_dict'])
@@ -466,6 +467,12 @@ def create_model(opt):
         elif(opt['model'] == "TVAMGSRN"):
             from Models.TVAMGSRN import TVAMGSRN
             return TVAMGSRN(opt)
+        elif(opt['model'] == "VEG"):
+            from Models.VEG import VEG
+            return VEG(opt)
+        elif(opt['model'] == "VEGS"):
+            from Models.VEGS import VEGS
+            return VEGS(opt)
    
 def sample_grid(model, grid, align_corners:bool = False,
                 device:str="cuda", data_device:str="cuda", max_points:int = 100000):

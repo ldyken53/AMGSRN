@@ -975,6 +975,11 @@ if __name__ == '__main__':
     model = model.to(opt['device'])
     model.train(False)
     model.eval()
+
+    param_bytes = sum(p.numel() * p.element_size() for p in model.parameters())
+    buffer_bytes = sum(b.numel() * b.element_size() for b in model.buffers())
+    size_mb = (param_bytes + buffer_bytes) / (1024 ** 2)
+    print(f"model size: {size_mb:.2f} MB")
     
     # Perform tests
     psnrs = []
