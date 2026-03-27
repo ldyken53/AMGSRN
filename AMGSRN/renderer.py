@@ -739,8 +739,10 @@ class Scene(torch.nn.Module):
 
             self.image[y::self.strides,x::self.strides,:] = new_colors
             self.mask[y::self.strides,x::self.strides,:] = 1
-            self.mip[mip_y:new_colors.shape[0]*mip_stride:mip_stride,
-                mip_x:new_colors.shape[1]*mip_stride:mip_stride,:] = new_colors
+            mip_slice_h = len(range(mip_y, self.mip.shape[0], mip_stride))
+            mip_slice_w = len(range(mip_x, self.mip.shape[1], mip_stride))
+            self.mip[mip_y::mip_stride,
+                mip_x::mip_stride,:] = new_colors[:mip_slice_h, :mip_slice_w]
             
             self.temp_image = self.image * self.mask + \
                 F.interpolate(self.mip.permute(2,0,1).unsqueeze(0), 

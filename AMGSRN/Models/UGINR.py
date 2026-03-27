@@ -362,4 +362,9 @@ class UGINR(nn.Module):
 
             y[idx] = preds.to(device=device, dtype=y.dtype)
 
-        return y.reshape(*original_shape, 1)
+        y = y.reshape(*original_shape, 1)
+        # probe_mesh = pv.PolyData(x.cpu().numpy())
+        # probed = probe_mesh.sample(self.mesh)
+        # valid_mask = probed['vtkValidPointMask'].astype(bool)
+        # y[~valid_mask] = 0
+        return y

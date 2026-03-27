@@ -461,7 +461,7 @@ class MainWindow(QMainWindow):
         if event.type() == QEvent.MouseButtonPress:
             if event.button() == Qt.LeftButton:
                 self.startRotate()
-            if event.button() == Qt.MiddleButton:
+            if event.button() == Qt.RightButton:
                 self.startPan()
                              
     def startPan(self):
@@ -521,7 +521,7 @@ class MainWindow(QMainWindow):
         if event.type() == QEvent.MouseButtonRelease:
             if(event.button()) == Qt.LeftButton:
                 self.endRotate()
-            if(event.button()) == Qt.MiddleButton:
+            if(event.button()) == Qt.RightButton:
                 self.endPan()
     
     def endPan(self):
