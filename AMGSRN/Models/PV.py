@@ -4,7 +4,6 @@ import os
 import numpy as np
 import pyvista as pv
 from math import exp, log
-import tinycudann as tcnn
 from plyfile import PlyData, PlyElement
 from bvh_diff_gaussian_rasterization import (
     GaussianRasterizationSettings,

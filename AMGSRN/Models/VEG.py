@@ -4,7 +4,6 @@ import os
 import numpy as np
 import pyvista as pv
 from math import exp, log
-import tinycudann as tcnn
 from plyfile import PlyData, PlyElement
 from bvh_diff_gaussian_rasterization import (
     GaussianRasterizationSettings,
@@ -19,7 +18,7 @@ class VEG(nn.Module):
         super().__init__()
         self.opt = opt
 
-        mesh = pv.read(opt["mesh_file"])
+        mesh = pv.read(os.path.join(opt['path_to_load'], opt["mesh_file"]))
         xmin, xmax, ymin, ymax, zmin, zmax = mesh.bounds
         global_min = min(xmin, ymin, zmin)
         global_max = max(xmax, ymax, zmax)
@@ -39,6 +38,8 @@ class VEG(nn.Module):
             ),
             axis=1,
         )
+        self.vol_extent = [xyz[:, 0].max(), xyz[:, 1].max(), xyz[:, 2].max()]
+        print(self.vol_extent)
 
         weights = np.asarray(plydata.elements[0]["weight"])[..., np.newaxis]
 
@@ -61,24 +62,42 @@ class VEG(nn.Module):
             rots[:, idx] = np.asarray(plydata.elements[0][attr_name])
 
         values = np.asarray(plydata.elements[0]["value"])[..., np.newaxis]
+       
+        xyz_t = torch.tensor(xyz, dtype=torch.float, device="cuda")
+        weight_t = torch.tensor(weights, dtype=torch.float, device="cuda")
+        scaling_t = torch.tensor(scales, dtype=torch.float, device="cuda")
+        rotation_t = torch.tensor(rots, dtype=torch.float, device="cuda")
+        values_t = torch.tensor(values, dtype=torch.float, device="cuda")
 
-        self._xyz = nn.Parameter(
-            torch.tensor(xyz, dtype=torch.float, device="cuda").requires_grad_(True)
-        )
-        self._weight = nn.Parameter(
-            torch.tensor(weights, dtype=torch.float, device="cuda").requires_grad_(
-                True
-            )
-        )
-        self._scaling = nn.Parameter(
-            torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True)
-        )
-        self._rotation = nn.Parameter(
-            torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True)
-        )
-        self._values = nn.Parameter(
-            torch.tensor(values, dtype=torch.float, device="cuda").requires_grad_(True)
-        )
+        # Sort by Morton code for spatial coherence
+        def morton3d_unit(xyz: torch.Tensor) -> torch.Tensor:
+            """Morton codes for points already in [0, 1]^3."""
+            norm = (xyz * ((1 << 21) - 1)).long()
+
+            def part1by2(n):
+                n = n & 0x1fffff
+                n = (n | (n << 32)) & 0x1f00000000ffff
+                n = (n | (n << 16)) & 0x1f0000ff0000ff
+                n = (n | (n << 8))  & 0x100f00f00f00f00f
+                n = (n | (n << 4))  & 0x10c30c30c30c30c3
+                n = (n | (n << 2))  & 0x1249249249249249
+                return n
+
+            return part1by2(norm[:, 0]) | (part1by2(norm[:, 1]) << 1) | (part1by2(norm[:, 2]) << 2)
+
+        order = torch.argsort(morton3d_unit(xyz_t))
+        xyz_t = xyz_t[order]
+        weight_t = weight_t[order]
+        scaling_t = scaling_t[order]
+        rotation_t = rotation_t[order]
+        values_t = values_t[order]
+
+        # Now wrap in nn.Parameter
+        self._xyz = nn.Parameter(xyz_t.requires_grad_(True))
+        self._weight = nn.Parameter(weight_t.requires_grad_(True))
+        self._scaling = nn.Parameter(scaling_t.requires_grad_(True))
+        self._rotation = nn.Parameter(rotation_t.requires_grad_(True))
+        self._values = nn.Parameter(values_t.requires_grad_(True))
 
         raster_settings = GaussianRasterizationSettings(
             volume_mins=[0, 0, 0],
@@ -161,10 +180,17 @@ class VEG(nn.Module):
         return self.volume_max
     
     def get_volume_extents(self):
-        return self.opt['full_shape']
+        return [
+            float(self.opt['full_shape'][0] * self.vol_extent[2]), 
+            float(self.opt['full_shape'][1] * self.vol_extent[1]), 
+            float(self.opt['full_shape'][2] * self.vol_extent[0]), 
+        ]
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = (x + 1) / 2
+        x[:, 0] *= self.vol_extent[0]
+        x[:, 1] *= self.vol_extent[1]
+        x[:, 2] *= self.vol_extent[2]
         probe_mesh = pv.PolyData(x.cpu().numpy())
         probed = probe_mesh.sample(self.mesh)
         valid_mask = probed['vtkValidPointMask'].astype(bool)
@@ -184,7 +210,5 @@ class VEG(nn.Module):
             weights=weights,
             debug=False
         )
-        print(y.shape)
-        print(torch.count_nonzero(y < 0))
         y[~valid_mask] = 0
         return y.reshape(-1, 1)
