@@ -306,7 +306,7 @@ def load_model(opt, device, path_to_load = None):
     except ImportError:
         tcnn_installed = False
 
-    if(not opt['ensemble']) and not (opt['model'] == 'VEG' or opt['model'] == 'VEGS' or opt['model'] == "PV"):
+    if(not opt['ensemble']) and not (opt['model'] == 'VEG' or opt['model'] == 'VEGS' or opt['model'] == "PV" or opt['model'] == "UGINR"):
         model = create_model(opt)
         if not opt['save_with_compression']:
             model.load_state_dict(torch.load(os.path.join(path_to_load, "model.ckpt"))['state_dict'])
@@ -476,6 +476,9 @@ def create_model(opt):
         elif(opt['model'] == "PV"):
             from Models.PV import PV
             return PV(opt)
+        elif(opt['model'] == "UGINR"):
+            from Models.UGINR import UGINR
+            return UGINR(opt)
    
 def sample_grid(model, grid, align_corners:bool = False,
                 device:str="cuda", data_device:str="cuda", max_points:int = 100000):
