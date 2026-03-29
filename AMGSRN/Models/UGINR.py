@@ -179,7 +179,9 @@ class UGINR(nn.Module):
         self.mesh = mesh
 
         xmin, xmax, ymin, ymax, zmin, zmax = mesh.bounds
-        self.vol_extent = [xmax, ymax, zmax]
+        self.vol_min = [xmin, ymin, zmin]
+        self.vol_max = [xmax, ymax, zmax]
+        self.vol_extent = [xmax - xmin, ymax - ymin, zmax - zmin]
 
         points = torch.from_numpy(mesh.points.astype(np.float32))
 
@@ -321,11 +323,10 @@ class UGINR(nn.Module):
         original_shape = x.shape[:-1]
         x = x.reshape(-1, 3)
 
-        x = (x + 1.0) / 2.0
-        x = x.clone()
-        x[:, 0] *= self.vol_extent[0]
-        x[:, 1] *= self.vol_extent[1]
-        x[:, 2] *= self.vol_extent[2]
+        x = (x + 1) / 2
+        x[:, 0] = x[:, 0] * self.vol_extent[0] + self.vol_min[0]
+        x[:, 1] = x[:, 1] * self.vol_extent[1] + self.vol_min[1]
+        x[:, 2] = x[:, 2] * self.vol_extent[2] + self.vol_min[2]
 
         x_np = x.detach().cpu().numpy().astype(np.float64)
         cluster_labels = self.kmeans.predict(x_np)

@@ -25,7 +25,11 @@ class PV(nn.Module):
         mesh.translate(np.array([-global_min, -global_min, -global_min]), inplace=True)
         mesh.scale(1.0/(global_max - global_min), inplace=True)
         self.mesh = mesh
-    
+
+        xmin, xmax, ymin, ymax, zmin, zmax = mesh.bounds
+        self.vol_min = [xmin, ymin, zmin]
+        self.vol_max = [xmax, ymax, zmax]
+        self.vol_extent = [xmax - xmin, ymax - ymin, zmax - zmin]
         self.register_buffer(
             "volume_min",
             torch.tensor([self.opt['data_min']], requires_grad=False, dtype=torch.float32),
@@ -36,31 +40,6 @@ class PV(nn.Module):
             torch.tensor([self.opt['data_max']], requires_grad=False, dtype=torch.float32),
             persistent=False
         )
-    
-    def _apply_cap(self, s):
-        r = torch.linalg.norm(s, dim=1, keepdim=True) + 1e-8
-        r_soft = self.max_scale * torch.tanh(r / self.max_scale)
-        return s * (r_soft / r)
-
-    @property
-    def get_scaling(self):
-        return self._apply_cap(self.scaling_activation(self._scaling))
-
-    @property
-    def get_rotation(self):
-        return self.rotation_activation(self._rotation)
-
-    @property
-    def get_xyz(self):
-        return self._xyz
-
-    @property
-    def get_weight(self):
-        return self.weight_activation(self._weight)
-
-    @property
-    def get_values(self):
-        return self.values_activation(self._values)
     
     def set_default_timestep(self, timestep:int):
         pass
@@ -81,16 +60,20 @@ class PV(nn.Module):
         return self.volume_max
     
     def get_volume_extents(self):
-        return self.opt['full_shape']
-    
+        return [
+            float(self.opt["full_shape"][0] * self.vol_extent[2]),
+            float(self.opt["full_shape"][1] * self.vol_extent[1]),
+            float(self.opt["full_shape"][2] * self.vol_extent[0]),
+        ]
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = (x + 1) / 2
+        x[:, 0] = x[:, 0] * self.vol_extent[0] + self.vol_min[0]
+        x[:, 1] = x[:, 1] * self.vol_extent[1] + self.vol_min[1]
+        x[:, 2] = x[:, 2] * self.vol_extent[2] + self.vol_min[2]
         probe_mesh = pv.PolyData(x.cpu().numpy())
         probed = probe_mesh.sample(self.mesh)
         y = probed[self.mesh.array_names[0]]
         valid_mask = probed['vtkValidPointMask'].astype(bool)
         y[~valid_mask] = 0
         y = torch.from_numpy(y).to(x.device)
-        print(y.shape)
-        print(np.count_nonzero(valid_mask))
         return y.reshape(-1, 1)

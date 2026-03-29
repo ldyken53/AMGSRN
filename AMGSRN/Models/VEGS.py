@@ -29,8 +29,11 @@ class VEGS(nn.Module):
             ),
             axis=1,
         )
-        self.vol_extent = [xyz[:, 0].max(), xyz[:, 1].max(), xyz[:, 2].max()]
-        print(self.vol_extent)
+
+        self.vol_min = [xyz[:, 0].min(), xyz[:, 1].min(), xyz[:, 2].min()]
+        self.vol_max = [xyz[:, 0].max(), xyz[:, 1].max(), xyz[:, 2].max()]
+        self.vol_extent = [self.vol_max[0] - self.vol_min[0], self.vol_max[1] - self.vol_min[1], self.vol_max[2] - self.vol_min[2]]
+        print(self.vol_min, self.vol_max)
 
         weights = np.asarray(plydata.elements[0]["weight"])[..., np.newaxis]
 
@@ -179,9 +182,9 @@ class VEGS(nn.Module):
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = (x + 1) / 2
-        x[:, 0] *= self.vol_extent[0]
-        x[:, 1] *= self.vol_extent[1]
-        x[:, 2] *= self.vol_extent[2]
+        x[:, 0] = x[:, 0] * self.vol_extent[0] + self.vol_min[0]
+        x[:, 1] = x[:, 1] * self.vol_extent[1] + self.vol_min[1]
+        x[:, 2] = x[:, 2] * self.vol_extent[2] + self.vol_min[2]
         
         self._rasterizer.build_bvh(x, False, False)
         means3D = self.get_xyz
@@ -199,5 +202,4 @@ class VEGS(nn.Module):
             debug=False
         )
         y = y.reshape(-1, 1)
-        # y = torch.ones([x.shape[0], 1])
         return y

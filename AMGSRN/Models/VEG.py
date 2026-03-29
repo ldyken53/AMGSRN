@@ -38,8 +38,11 @@ class VEG(nn.Module):
             ),
             axis=1,
         )
-        self.vol_extent = [xyz[:, 0].max(), xyz[:, 1].max(), xyz[:, 2].max()]
-        print(self.vol_extent)
+        
+        self.vol_min = [xyz[:, 0].min(), xyz[:, 1].min(), xyz[:, 2].min()]
+        self.vol_max = [xyz[:, 0].max(), xyz[:, 1].max(), xyz[:, 2].max()]
+        self.vol_extent = [self.vol_max[0] - self.vol_min[0], self.vol_max[1] - self.vol_min[1], self.vol_max[2] - self.vol_min[2]]
+        print(self.vol_min, self.vol_max)
 
         weights = np.asarray(plydata.elements[0]["weight"])[..., np.newaxis]
 
@@ -188,9 +191,9 @@ class VEG(nn.Module):
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = (x + 1) / 2
-        x[:, 0] *= self.vol_extent[0]
-        x[:, 1] *= self.vol_extent[1]
-        x[:, 2] *= self.vol_extent[2]
+        x[:, 0] = x[:, 0] * self.vol_extent[0] + self.vol_min[0]
+        x[:, 1] = x[:, 1] * self.vol_extent[1] + self.vol_min[1]
+        x[:, 2] = x[:, 2] * self.vol_extent[2] + self.vol_min[2]
         probe_mesh = pv.PolyData(x.cpu().numpy())
         probed = probe_mesh.sample(self.mesh)
         valid_mask = probed['vtkValidPointMask'].astype(bool)
