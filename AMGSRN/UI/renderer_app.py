@@ -10,7 +10,7 @@ from PyQt5.QtCore import QSize, Qt, QTimer, QMutex
 from PyQt5.QtGui import QImage, QPixmap, QPalette, QColor, QIcon
 from PyQt5.QtWidgets import QApplication, QMainWindow, QPushButton, \
     QWidget, QLabel, QHBoxLayout, QVBoxLayout, QStackedLayout, \
-    QComboBox, QSlider, QFileDialog, QColorDialog
+    QComboBox, QSlider, QFileDialog, QColorDialog, QCheckBox, QGroupBox
 from superqt import QRangeSlider
 from PyQt5.QtCore import QObject, QThread, pyqtSignal, QEvent, Qt
 from AMGSRN.renderer import Camera, Scene, TransferFunction, RawData
@@ -22,6 +22,14 @@ import pyqtgraph as pg
 import imageio.v3 as imageio
 
 pg.setConfigOptions(antialias=True)
+
+def linear_to_log(y):
+    """Map linear [0,1] opacity to log-scaled [0,1] for display (3 decades)."""
+    return np.log10(np.clip(y, 0, 1) * 999 + 1) / 3.0
+
+def log_to_linear(y):
+    """Map log-scaled [0,1] display value back to linear [0,1] opacity."""
+    return (np.power(10, np.clip(y, 0, 1) * 3.0) - 1) / 999.0
 
 # For locking renderer actions
 render_mutex = QMutex()
@@ -60,7 +68,9 @@ class TransferFunctionEditor(pg.GraphItem):
             self.data['pos'][:,0] -= self.data['pos'][0,0]
             self.data['pos'][:,0] /= self.data['pos'][-1,0]
             # Clip opacity between 0 and 1
-            self.data['pos'][:,1] = np.clip(self.data['pos'][:,1], 0.0, 1.0)            
+            self.data['pos'][:,1] = np.clip(self.data['pos'][:,1], 0.0, 1.0)
+            # Convert Y to log display space
+            self.data['pos'][:,1] = linear_to_log(self.data['pos'][:,1])
             self.data['adj'] = np.column_stack((np.arange(0, npts-1), np.arange(1, npts)))
             self.data['data'] = np.empty(npts, dtype=[('index', int)])
             self.data['data']['index'] = np.arange(npts)
@@ -71,7 +81,8 @@ class TransferFunctionEditor(pg.GraphItem):
         if(self.parent is not None):
             if "pos" in self.data.keys():
                 opacity_control_points = self.data['pos'][:,0]
-                opacity_values = self.data['pos'][:,1]
+                # Convert Y back from log display space to linear for the renderer
+                opacity_values = log_to_linear(self.data['pos'][:,1])
                 if self.parent.render_worker is not None:
                     self.parent.render_worker.change_opacity_controlpoints.emit(
                         opacity_control_points, opacity_values
@@ -243,6 +254,120 @@ class MainWindow(QMainWindow):
         self.density_toggle.setFixedHeight(25)
         self.density_toggle.clicked.connect(self.toggle_density)
         
+        # === Lighting controls ===
+        self.lighting_group = QGroupBox("Lighting")
+        self.lighting_layout = QVBoxLayout()
+
+        # Shading on/off
+        self.shading_checkbox = QCheckBox("Enable shading")
+        self.shading_checkbox.setChecked(True)
+        self.shading_checkbox.stateChanged.connect(self.change_shading_enabled)
+        self.lighting_layout.addWidget(self.shading_checkbox)
+
+        # Light mode dropdown
+        self.light_mode_box = QHBoxLayout()
+        self.light_mode_box.addWidget(QLabel("Light mode:"))
+        self.light_mode_dropdown = QComboBox()
+        self.light_mode_dropdown.addItems(["Headlight", "Scene light"])
+        self.light_mode_dropdown.currentTextChanged.connect(self.change_light_mode)
+        self.light_mode_box.addWidget(self.light_mode_dropdown)
+        self.lighting_layout.addLayout(self.light_mode_box)
+
+        # Ambient slider
+        self.ambient_slider_box = QHBoxLayout()
+        self.ambient_slider_label = QLabel("Ambient: 0.30")
+        self.ambient_slider_box.addWidget(self.ambient_slider_label)
+        self.ambient_slider = QSlider(Qt.Horizontal)
+        self.ambient_slider.setMinimum(0)
+        self.ambient_slider.setMaximum(100)
+        self.ambient_slider.setValue(30)
+        self.ambient_slider.valueChanged.connect(self.change_ambient_visual)
+        self.ambient_slider.sliderReleased.connect(self.change_ambient)
+        self.ambient_slider_box.addWidget(self.ambient_slider)
+        self.lighting_layout.addLayout(self.ambient_slider_box)
+
+        # Diffuse slider
+        self.diffuse_slider_box = QHBoxLayout()
+        self.diffuse_slider_label = QLabel("Diffuse: 0.70")
+        self.diffuse_slider_box.addWidget(self.diffuse_slider_label)
+        self.diffuse_slider = QSlider(Qt.Horizontal)
+        self.diffuse_slider.setMinimum(0)
+        self.diffuse_slider.setMaximum(100)
+        self.diffuse_slider.setValue(70)
+        self.diffuse_slider.valueChanged.connect(self.change_diffuse_visual)
+        self.diffuse_slider.sliderReleased.connect(self.change_diffuse)
+        self.diffuse_slider_box.addWidget(self.diffuse_slider)
+        self.lighting_layout.addLayout(self.diffuse_slider_box)
+
+        # Specular slider
+        self.specular_slider_box = QHBoxLayout()
+        self.specular_slider_label = QLabel("Specular: 0.00")
+        self.specular_slider_box.addWidget(self.specular_slider_label)
+        self.specular_slider = QSlider(Qt.Horizontal)
+        self.specular_slider.setMinimum(0)
+        self.specular_slider.setMaximum(100)
+        self.specular_slider.setValue(0)
+        self.specular_slider.valueChanged.connect(self.change_specular_visual)
+        self.specular_slider.sliderReleased.connect(self.change_specular)
+        self.specular_slider_box.addWidget(self.specular_slider)
+        self.lighting_layout.addLayout(self.specular_slider_box)
+
+        # Shininess slider
+        self.shininess_slider_box = QHBoxLayout()
+        self.shininess_slider_label = QLabel("Shininess: 32")
+        self.shininess_slider_box.addWidget(self.shininess_slider_label)
+        self.shininess_slider = QSlider(Qt.Horizontal)
+        self.shininess_slider.setMinimum(1)
+        self.shininess_slider.setMaximum(128)
+        self.shininess_slider.setValue(32)
+        self.shininess_slider.valueChanged.connect(self.change_shininess_visual)
+        self.shininess_slider.sliderReleased.connect(self.change_shininess)
+        self.shininess_slider_box.addWidget(self.shininess_slider)
+        self.lighting_layout.addLayout(self.shininess_slider_box)
+
+        # Scene light position sliders (X, Y, Z)
+        self.light_pos_label = QLabel("Light position (scene mode):")
+        self.lighting_layout.addWidget(self.light_pos_label)
+
+        self.light_x_box = QHBoxLayout()
+        self.light_x_label = QLabel("X: 0.50")
+        self.light_x_box.addWidget(self.light_x_label)
+        self.light_x_slider = QSlider(Qt.Horizontal)
+        self.light_x_slider.setMinimum(-100)
+        self.light_x_slider.setMaximum(300)
+        self.light_x_slider.setValue(50)
+        self.light_x_slider.valueChanged.connect(self.change_light_pos_visual)
+        self.light_x_slider.sliderReleased.connect(self.change_light_position)
+        self.light_x_box.addWidget(self.light_x_slider)
+        self.lighting_layout.addLayout(self.light_x_box)
+
+        self.light_y_box = QHBoxLayout()
+        self.light_y_label = QLabel("Y: 0.50")
+        self.light_y_box.addWidget(self.light_y_label)
+        self.light_y_slider = QSlider(Qt.Horizontal)
+        self.light_y_slider.setMinimum(-100)
+        self.light_y_slider.setMaximum(300)
+        self.light_y_slider.setValue(50)
+        self.light_y_slider.valueChanged.connect(self.change_light_pos_visual)
+        self.light_y_slider.sliderReleased.connect(self.change_light_position)
+        self.light_y_box.addWidget(self.light_y_slider)
+        self.lighting_layout.addLayout(self.light_y_box)
+
+        self.light_z_box = QHBoxLayout()
+        self.light_z_label = QLabel("Z: 0.50")
+        self.light_z_box.addWidget(self.light_z_label)
+        self.light_z_slider = QSlider(Qt.Horizontal)
+        self.light_z_slider.setMinimum(-100)
+        self.light_z_slider.setMaximum(300)
+        self.light_z_slider.setValue(50)
+        self.light_z_slider.valueChanged.connect(self.change_light_pos_visual)
+        self.light_z_slider.sliderReleased.connect(self.change_light_position)
+        self.light_z_box.addWidget(self.light_z_slider)
+        self.lighting_layout.addLayout(self.light_z_box)
+
+        self.lighting_group.setLayout(self.lighting_layout)
+        # === End lighting controls ===
+
         self.transfer_function_box = QVBoxLayout()
         self.tf_editor = TransferFunctionEditor(self)
         self.background_color_box = QHBoxLayout()
@@ -282,7 +407,8 @@ class MainWindow(QMainWindow):
         
         x = np.linspace(0.0, 1.0, 4)
         pos = np.column_stack((x, x))
-        win = pg.GraphicsLayoutWidget() 
+        win = pg.GraphicsLayoutWidget()
+        win.setMinimumHeight(250)
         view = win.addViewBox(row=0, col=1, rowspan=2, colspan=2) 
         view.enableAutoRange(axis='xy', enable=False)
         view.setYRange(0, 1.0, padding=0.1, update=True)
@@ -290,7 +416,17 @@ class MainWindow(QMainWindow):
         view.setBackgroundColor([255, 255, 255, 255])
         view.setMouseEnabled(x=False,y=False)
         x_axis = pg.AxisItem("bottom", linkView=view)
-        y_axis = pg.AxisItem("left", linkView=view)     
+        # Custom log-scale tick labels for the Y axis
+        log_ticks = [
+            (linear_to_log(0.0), "0"),
+            (linear_to_log(0.001), "0.001"),
+            (linear_to_log(0.01), "0.01"),
+            (linear_to_log(0.1), "0.1"),
+            (linear_to_log(0.5), "0.5"),
+            (linear_to_log(1.0), "1.0"),
+        ]
+        y_axis = pg.AxisItem("left", linkView=view)
+        y_axis.setTicks([log_ticks])
         win.addItem(x_axis, row=2, col=1, colspan=2)
         win.addItem(y_axis, row=0, col=0, rowspan=2)
         view.addItem(self.tf_editor)
@@ -317,6 +453,7 @@ class MainWindow(QMainWindow):
         self.settings_ui.addLayout(self.spp_slider_box)
         self.settings_ui.addWidget(self.view_xy_button)
         self.settings_ui.addWidget(self.density_toggle)
+        self.settings_ui.addWidget(self.lighting_group)
         self.settings_ui.addLayout(self.transfer_function_box)
         self.settings_ui.addLayout(self.tf_rescale_slider_box)
         self.settings_ui.addLayout(self.timestep_selector_box)
@@ -516,7 +653,67 @@ class MainWindow(QMainWindow):
     def change_tf_range(self):
         dmin, dmax = [int(v) for v in self.tf_rescale_slider.value()]
         self.render_worker.tf_rescale.emit(dmin/1000.0, dmax/1000.0)
-     
+
+    # === Lighting UI callbacks ===
+    def change_shading_enabled(self, state):
+        enabled = state == Qt.Checked
+        self.render_worker.change_shading_enabled.emit(enabled)
+
+    def change_light_mode(self, text):
+        mode = 'headlight' if text == "Headlight" else 'scene'
+        self.render_worker.change_light_mode.emit(mode)
+
+    def change_ambient_visual(self):
+        val = self.ambient_slider.value() / 100.0
+        self.ambient_slider_label.setText(f"Ambient: {val:.2f}")
+
+    def change_ambient(self):
+        val = self.ambient_slider.value() / 100.0
+        self.ambient_slider_label.setText(f"Ambient: {val:.2f}")
+        self.render_worker.change_ambient.emit(val)
+
+    def change_diffuse_visual(self):
+        val = self.diffuse_slider.value() / 100.0
+        self.diffuse_slider_label.setText(f"Diffuse: {val:.2f}")
+
+    def change_diffuse(self):
+        val = self.diffuse_slider.value() / 100.0
+        self.diffuse_slider_label.setText(f"Diffuse: {val:.2f}")
+        self.render_worker.change_diffuse.emit(val)
+
+    def change_specular_visual(self):
+        val = self.specular_slider.value() / 100.0
+        self.specular_slider_label.setText(f"Specular: {val:.2f}")
+
+    def change_specular(self):
+        val = self.specular_slider.value() / 100.0
+        self.specular_slider_label.setText(f"Specular: {val:.2f}")
+        self.render_worker.change_specular.emit(val)
+
+    def change_shininess_visual(self):
+        val = self.shininess_slider.value()
+        self.shininess_slider_label.setText(f"Shininess: {val}")
+
+    def change_shininess(self):
+        val = self.shininess_slider.value()
+        self.shininess_slider_label.setText(f"Shininess: {val}")
+        self.render_worker.change_shininess.emit(float(val))
+
+    def change_light_pos_visual(self):
+        x = self.light_x_slider.value() / 100.0
+        y = self.light_y_slider.value() / 100.0
+        z = self.light_z_slider.value() / 100.0
+        self.light_x_label.setText(f"X: {x:.2f}")
+        self.light_y_label.setText(f"Y: {y:.2f}")
+        self.light_z_label.setText(f"Z: {z:.2f}")
+
+    def change_light_position(self):
+        x = self.light_x_slider.value() / 100.0
+        y = self.light_y_slider.value() / 100.0
+        z = self.light_z_slider.value() / 100.0
+        self.render_worker.change_light_position.emit(x, y, z)
+    # === End lighting UI callbacks ===
+
     def mouseReleased(self, event):
         if event.type() == QEvent.MouseButtonRelease:
             if(event.button()) == Qt.LeftButton:
@@ -586,6 +783,14 @@ class RendererThread(QObject):
     view_xy = pyqtSignal()
     tf_rescale = pyqtSignal(float, float)
     toggle_density = pyqtSignal()
+    # Lighting signals
+    change_shading_enabled = pyqtSignal(bool)
+    change_light_mode = pyqtSignal(str)
+    change_ambient = pyqtSignal(float)
+    change_diffuse = pyqtSignal(float)
+    change_specular = pyqtSignal(float)
+    change_shininess = pyqtSignal(float)
+    change_light_position = pyqtSignal(float, float, float)
 
     def __init__(self, parent=None):
         super(RendererThread, self).__init__()
@@ -631,6 +836,14 @@ class RendererThread(QObject):
         self.view_xy.connect(self.do_view_xy)
         self.tf_rescale.connect(self.do_tf_rescale)
         self.toggle_density.connect(self.do_toggle_density)
+        # Lighting event connections
+        self.change_shading_enabled.connect(self.do_change_shading_enabled)
+        self.change_light_mode.connect(self.do_change_light_mode)
+        self.change_ambient.connect(self.do_change_ambient)
+        self.change_diffuse.connect(self.do_change_diffuse)
+        self.change_specular.connect(self.do_change_specular)
+        self.change_shininess.connect(self.do_change_shininess)
+        self.change_light_position.connect(self.do_change_light_position)
         self.parent.status_text_update.emit(f"")
         
     def run(self):
@@ -883,6 +1096,58 @@ class RendererThread(QObject):
         print(f"Min/max: {self.model.min().item():0.02f}/{self.model.max().item():0.02f}")
         self.scene.on_setting_change()
         render_mutex.unlock()
+
+    # === Lighting handler methods ===
+    def do_change_shading_enabled(self, enabled):
+        render_mutex.lock()
+        self.scene.use_shading = enabled
+        self.scene.on_rotate_zoom_pan()
+        render_mutex.unlock()
+
+    def do_change_light_mode(self, mode):
+        render_mutex.lock()
+        self.scene.light_mode = mode
+        self.scene.on_rotate_zoom_pan()
+        render_mutex.unlock()
+
+    def do_change_ambient(self, val):
+        render_mutex.lock()
+        self.scene.ambient = val
+        self.scene.on_rotate_zoom_pan()
+        render_mutex.unlock()
+
+    def do_change_diffuse(self, val):
+        render_mutex.lock()
+        self.scene.diffuse_strength = val
+        self.scene.on_rotate_zoom_pan()
+        render_mutex.unlock()
+
+    def do_change_specular(self, val):
+        render_mutex.lock()
+        self.scene.specular_strength = val
+        self.scene.on_rotate_zoom_pan()
+        render_mutex.unlock()
+
+    def do_change_shininess(self, val):
+        render_mutex.lock()
+        self.scene.shininess = val
+        self.scene.on_rotate_zoom_pan()
+        render_mutex.unlock()
+
+    def do_change_light_position(self, x, y, z):
+        render_mutex.lock()
+        import torch
+        # Scale normalized [0,1] slider values to AABB extent
+        aabb_extent = self.scene.scene_aabb[3:]
+        self.scene.light_position = torch.tensor(
+            [x * aabb_extent[0].item(),
+             y * aabb_extent[1].item(),
+             z * aabb_extent[2].item()],
+            device=self.scene.device
+        )
+        self.scene.on_rotate_zoom_pan()
+        render_mutex.unlock()
+    # === End lighting handler methods ===
 
 def run_renderer():
     app = QApplication([])

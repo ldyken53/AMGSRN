@@ -421,6 +421,14 @@ class Scene(torch.nn.Module):
         self.camera = camera
         self.background_color = torch.tensor([1.0, 1.0, 1.0], dtype=torch.float32, device=self.device)
         self.use_density = False
+        self.use_shading = True
+        # Lighting parameters
+        self.ambient = 0.3
+        self.diffuse_strength = 0.7
+        self.specular_strength = 0.0
+        self.shininess = 32.0
+        self.light_mode = 'headlight'  # 'headlight' or 'scene'
+        self.light_position = self.scene_aabb[3:].clone() * 2.0  # default: above and in front
         self.on_setting_change()
     
     def set_model(self, model):
@@ -474,20 +482,61 @@ class Scene(torch.nn.Module):
         return ray_indices, t_starts, t_ends
         
     def rgb_alpha_fn(self, t_starts, t_ends, ray_indices):
-        sample_locs = self.rays_o[ray_indices] + self.rays_d[ray_indices] * (t_starts + t_ends)[:,None] / 2.0
+        sample_locs = self.rays_o[ray_indices] + self.rays_d[ray_indices] * (t_starts + t_ends)[:, None] / 2.0
         sample_locs /= self.scene_aabb[3:]
-        sample_locs *= 2 
+        sample_locs *= 2
         sample_locs -= 1
-        if(self.use_density):
-            densities = self.model.feature_density(sample_locs.to(self.data_device)).to(self.device)[:,None]
-            densities /= densities.max()
-        else:
-            densities = self.model(sample_locs.to(self.data_device)).to(self.device)
-        rgbs, alphas = self.transfer_function.color_opacity_at_value(densities[:,0])
+
+        densities = self.model(sample_locs.to(self.data_device)).to(self.device)
+        rgbs, alphas = self.transfer_function.color_opacity_at_value(densities[:, 0])
+
+        if self.use_shading:
+            mask = alphas[:, 0] > 0.01
+            if mask.any():
+                masked_locs = sample_locs[mask].to(self.data_device)
+                gradients = self.compute_gradient(masked_locs, eps=0.01).to(self.device)
+                grad_mag = torch.norm(gradients, dim=-1, keepdim=True)
+
+                has_gradient = (grad_mag > 1e-4).float()
+                normals = gradients / (grad_mag + 1e-6)
+
+                # View direction (always needed for flipping and specular)
+                view_dir = -self.rays_d[ray_indices[mask]]
+                view_dir = view_dir / (torch.norm(view_dir, dim=-1, keepdim=True) + 1e-8)
+
+                # Flip normals to face the viewer
+                flip = (torch.sum(normals * view_dir, dim=-1, keepdim=True) < 0).float()
+                normals = normals * (1 - 2 * flip)
+
+                # Determine light direction per sample
+                if self.light_mode == 'headlight':
+                    light_dir = view_dir
+                else:
+                    # Scene light: compute direction from sample world position to light
+                    # Recover world-space positions from normalized sample_locs
+                    world_locs = (sample_locs[mask] + 1.0) / 2.0 * self.scene_aabb[3:]
+                    light_vec = self.light_position.to(self.device) - world_locs
+                    light_dir = light_vec / (torch.norm(light_vec, dim=-1, keepdim=True) + 1e-8)
+
+                # Diffuse (Lambertian)
+                n_dot_l = torch.clamp(torch.sum(normals * light_dir, dim=-1, keepdim=True), 0.0, 1.0)
+                diffuse = self.diffuse_strength * n_dot_l
+
+                # Specular (Blinn-Phong)
+                specular = torch.zeros_like(diffuse)
+                if self.specular_strength > 0.0:
+                    halfway = view_dir + light_dir
+                    halfway = halfway / (torch.norm(halfway, dim=-1, keepdim=True) + 1e-8)
+                    n_dot_h = torch.clamp(torch.sum(normals * halfway, dim=-1, keepdim=True), 0.0, 1.0)
+                    specular = self.specular_strength * torch.pow(n_dot_h, self.shininess)
+
+                shaded = rgbs[mask] * (self.ambient + diffuse) + specular
+                rgbs[mask] = has_gradient * shaded + (1 - has_gradient) * rgbs[mask]
+
+        rgbs.clamp_(0.0, 1.0)
         alphas += 1
         alphas.log_()
-        
-        return rgbs, alphas[:,0]
+        return rgbs, alphas[:, 0]
     
     def rgb_alpha_fn_batch(self, t_starts, t_ends, ray_indices):
         '''
@@ -739,10 +788,10 @@ class Scene(torch.nn.Module):
 
             self.image[y::self.strides,x::self.strides,:] = new_colors
             self.mask[y::self.strides,x::self.strides,:] = 1
-            mip_slice_h = len(range(mip_y, self.mip.shape[0], mip_stride))
-            mip_slice_w = len(range(mip_x, self.mip.shape[1], mip_stride))
-            self.mip[mip_y::mip_stride,
-                mip_x::mip_stride,:] = new_colors[:mip_slice_h, :mip_slice_w]
+            mip_view = self.mip[mip_y::mip_stride, mip_x::mip_stride, :]
+            assign_h = min(mip_view.shape[0], new_colors.shape[0])
+            assign_w = min(mip_view.shape[1], new_colors.shape[1])
+            mip_view[:assign_h, :assign_w, :] = new_colors[:assign_h, :assign_w]
             
             self.temp_image = self.image * self.mask + \
                 F.interpolate(self.mip.permute(2,0,1).unsqueeze(0), 
@@ -772,6 +821,19 @@ class Scene(torch.nn.Module):
                     
         return self.image, imgs
     
+    def compute_gradient(self, sample_locs, eps=0.001):
+        offsets = torch.tensor([[eps,0,0],[-eps,0,0],
+                                [0,eps,0],[0,-eps,0],
+                                [0,0,eps],[0,0,-eps]], device=sample_locs.device)
+        # (6*N, 3) — one big batch instead of 6 separate calls
+        all_locs = (sample_locs.unsqueeze(0) + offsets.unsqueeze(1)).reshape(-1, 3).clamp(-1, 1)
+        all_vals = self.model(all_locs)[:, 0]  # (6*N,)
+        all_vals = all_vals.reshape(6, -1)     # (6, N)
+        
+        gx = all_vals[0] - all_vals[1]
+        gy = all_vals[2] - all_vals[3]
+        gz = all_vals[4] - all_vals[5]
+        return torch.stack([gx, gy, gz], dim=-1)
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Evaluate a model on some tests')
@@ -967,4 +1029,3 @@ if __name__ == '__main__':
     GBytes = (torch.cuda.max_memory_allocated(device=device) \
                 / (1024**3))
     print(f"{GBytes : 0.02f}GB of memory used (max reserved) during render.")
-    
