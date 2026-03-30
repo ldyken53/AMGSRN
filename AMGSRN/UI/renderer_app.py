@@ -18,6 +18,7 @@ from AMGSRN.UI.utils import Arcball, torch_float_to_numpy_uint8
 from AMGSRN.Models.options import load_options
 from AMGSRN.Models.models import load_model
 from typing import List
+import json
 import pyqtgraph as pg
 import imageio.v3 as imageio
 
@@ -30,6 +31,37 @@ def linear_to_log(y):
 def log_to_linear(y):
     """Map log-scaled [0,1] display value back to linear [0,1] opacity."""
     return (np.power(10, np.clip(y, 0, 1) * 3.0) - 1) / 999.0
+
+def serialize_camera_state(camera):
+    """Extract all serializable state from an Arcball camera into a dict."""
+    skip_keys = {
+        'camera_dirs', 'mouse_start', 'mouse_curr',
+        'width', 'height', 'resolution',
+    }
+    state = {}
+    for key, val in vars(camera).items():
+        if key in skip_keys:
+            continue
+        if isinstance(val, np.ndarray):
+            state[key] = {"__ndarray__": True, "data": val.tolist(), "dtype": str(val.dtype)}
+        elif isinstance(val, (float, int, bool, str)):
+            state[key] = val
+        elif isinstance(val, np.floating):
+            state[key] = float(val)
+        elif isinstance(val, np.integer):
+            state[key] = int(val)
+        # Skip non-serializable attributes silently
+    return state
+
+def deserialize_camera_state(state):
+    """Convert a serialized camera state dict back to native types."""
+    restored = {}
+    for key, val in state.items():
+        if isinstance(val, dict) and val.get("__ndarray__"):
+            restored[key] = np.array(val["data"], dtype=val["dtype"])
+        else:
+            restored[key] = val
+    return restored
 
 # For locking renderer actions
 render_mutex = QMutex()
@@ -178,6 +210,7 @@ class MainWindow(QMainWindow):
     vram_use = pyqtSignal(float)
     status_text_update = pyqtSignal(str)
     timestep_max = pyqtSignal(int)
+    render_status = pyqtSignal(str)
     render_worker = None
     
     def __init__(self, parent=None):
@@ -197,6 +230,7 @@ class MainWindow(QMainWindow):
         
         # Render area
         self.render_view = QLabel()   
+        self.render_view.setMaximumWidth(1335)
         self.render_view.mousePressEvent = self.mouseClicked
         self.render_view.mouseReleaseEvent = self.mouseReleased
         self.render_view.mouseMoveEvent = self.mouseMove   
@@ -253,7 +287,20 @@ class MainWindow(QMainWindow):
         self.density_toggle = QPushButton("Toggle density")
         self.density_toggle.setFixedHeight(25)
         self.density_toggle.clicked.connect(self.toggle_density)
-        
+
+        # === Camera save/load buttons ===
+        self.camera_io_box = QHBoxLayout()
+        self.save_camera_button = QPushButton("Save Camera")
+        self.save_camera_button.setFixedHeight(25)
+        self.save_camera_button.clicked.connect(self.save_camera)
+        self.camera_io_box.addWidget(self.save_camera_button)
+
+        self.load_camera_button = QPushButton("Load Camera")
+        self.load_camera_button.setFixedHeight(25)
+        self.load_camera_button.clicked.connect(self.load_camera)
+        self.camera_io_box.addWidget(self.load_camera_button)
+        # === End camera save/load buttons ===
+
         # === Lighting controls ===
         self.lighting_group = QGroupBox("Lighting")
         self.lighting_layout = QVBoxLayout()
@@ -439,11 +486,13 @@ class MainWindow(QMainWindow):
         self.memory_use_label = QLabel("VRAM use: -- GB") 
         self.update_framerate_label = QLabel("Update framerate: -- fps") 
         self.frame_time_label = QLabel("Last frame time: -- sec.") 
+        self.render_status_label = QLabel("Render: idle")
         self.status_text_update.connect(self.update_status_text)
         self.vram_use.connect(self.update_vram)
         self.timestep_max.connect(self.update_timestep_max)
         self.updates_per_second.connect(self.update_updates)
         self.frame_time.connect(self.update_frame_time)
+        self.render_status.connect(self.update_render_status)
         self.save_img_button = QPushButton("Save image")
         self.save_img_button.clicked.connect(self.save_img)
         
@@ -453,6 +502,7 @@ class MainWindow(QMainWindow):
         self.settings_ui.addLayout(self.spp_slider_box)
         self.settings_ui.addWidget(self.view_xy_button)
         self.settings_ui.addWidget(self.density_toggle)
+        self.settings_ui.addLayout(self.camera_io_box)
         self.settings_ui.addWidget(self.lighting_group)
         self.settings_ui.addLayout(self.transfer_function_box)
         self.settings_ui.addLayout(self.tf_rescale_slider_box)
@@ -462,6 +512,7 @@ class MainWindow(QMainWindow):
         self.settings_ui.addWidget(self.memory_use_label)
         self.settings_ui.addWidget(self.update_framerate_label)
         self.settings_ui.addWidget(self.frame_time_label)
+        self.settings_ui.addWidget(self.render_status_label)
         self.settings_ui.addWidget(self.save_img_button)
         
         # UI full layout        
@@ -525,7 +576,42 @@ class MainWindow(QMainWindow):
         if event.key() == Qt.Key_Delete:
             self.tf_editor.deleteLastPoint()
         event.accept()
-        
+
+    def save_camera(self):
+        """Save current camera state to a JSON file."""
+        filepath, _ = QFileDialog.getSaveFileName(
+            self, "Save Camera View", "", "JSON Files (*.json);;All Files (*)"
+        )
+        if not filepath:
+            return
+        if not filepath.endswith(".json"):
+            filepath += ".json"
+
+        render_mutex.lock()
+        state = serialize_camera_state(self.render_worker.camera)
+        render_mutex.unlock()
+
+        with open(filepath, 'w') as f:
+            json.dump(state, f, indent=2)
+        print(f"Camera saved to {filepath}")
+        self.status_text_update.emit(f"Camera saved to {os.path.basename(filepath)}")
+
+    def load_camera(self):
+        """Load camera state from a JSON file and apply it."""
+        filepath, _ = QFileDialog.getOpenFileName(
+            self, "Load Camera View", "", "JSON Files (*.json);;All Files (*)"
+        )
+        if not filepath:
+            return
+
+        with open(filepath, 'r') as f:
+            state = json.load(f)
+
+        restored = deserialize_camera_state(state)
+        self.render_worker.load_camera_state.emit(restored)
+        print(f"Camera loaded from {filepath}")
+        self.status_text_update.emit(f"Camera loaded from {os.path.basename(filepath)}")
+
     def save_img(self):
         folderpath,_ = QFileDialog.getSaveFileName(self, 'Select Save Location')
         if ".jpg" not in folderpath and ".png" not in folderpath:
@@ -561,6 +647,9 @@ class MainWindow(QMainWindow):
 
     def update_frame_time(self, val):
         self.frame_time_label.setText(f"Last frame time: {val:0.02f} sec.")
+
+    def update_render_status(self, val):
+        self.render_status_label.setText(f"Render: {val}")
      
     def data_box_update(self, s):
         self.loading_model = "Model" in s
@@ -791,6 +880,8 @@ class RendererThread(QObject):
     change_specular = pyqtSignal(float)
     change_shininess = pyqtSignal(float)
     change_light_position = pyqtSignal(float, float, float)
+    # Camera state signal
+    load_camera_state = pyqtSignal(dict)
 
     def __init__(self, parent=None):
         super(RendererThread, self).__init__()
@@ -844,6 +935,8 @@ class RendererThread(QObject):
         self.change_specular.connect(self.do_change_specular)
         self.change_shininess.connect(self.do_change_shininess)
         self.change_light_position.connect(self.do_change_light_position)
+        # Camera state connection
+        self.load_camera_state.connect(self.do_load_camera_state)
         self.parent.status_text_update.emit(f"")
         
     def run(self):
@@ -858,6 +951,7 @@ class RendererThread(QObject):
                 render_mutex.lock()
                 if(self.scene.current_order_spot == 0):
                     frame_start_time = time.time()
+                    self.parent.render_status.emit("Rendering...")
                 update_start_time = time.time()
                 self.scene.one_step_update()
                 if(current_spot < len(self.scene.render_order)):
@@ -869,6 +963,7 @@ class RendererThread(QObject):
                         self.frame_rate.append(frame_time)
                         last_frame_time = self.frame_rate[-1]
                         self.parent.frame_time.emit(last_frame_time)
+                        self.parent.render_status.emit("Complete")
                 img = torch_float_to_numpy_uint8(self.scene.temp_image)
                 render_mutex.unlock()
 
@@ -1096,6 +1191,28 @@ class RendererThread(QObject):
         print(f"Min/max: {self.model.min().item():0.02f}/{self.model.max().item():0.02f}")
         self.scene.on_setting_change()
         render_mutex.unlock()
+
+    # === Camera state handler ===
+    # Attributes that are transient or resolution-dependent and should
+    # not be saved/loaded — they get regenerated by the scene or camera.
+    _CAMERA_SKIP_KEYS = {
+        'camera_dirs', 'mouse_start', 'mouse_curr',
+        'width', 'height', 'resolution',
+    }
+
+    def do_load_camera_state(self, restored):
+        """Apply a deserialized camera state dict to the current camera."""
+        render_mutex.lock()
+        for key, val in restored.items():
+            if key in self._CAMERA_SKIP_KEYS:
+                continue
+            if hasattr(self.camera, key):
+                setattr(self.camera, key, val)
+            else:
+                print(f"Warning: camera has no attribute '{key}', skipping")
+        self.scene.on_rotate_zoom_pan()
+        render_mutex.unlock()
+    # === End camera state handler ===
 
     # === Lighting handler methods ===
     def do_change_shading_enabled(self, enabled):
