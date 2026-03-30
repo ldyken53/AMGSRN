@@ -319,14 +319,14 @@ class UGINR(nn.Module):
         ]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        device = x.device
-        original_shape = x.shape[:-1]
-        x = x.reshape(-1, 3)
-
         x = (x + 1) / 2
         x[:, 0] = x[:, 0] * self.vol_extent[0] + self.vol_min[0]
         x[:, 1] = x[:, 1] * self.vol_extent[1] + self.vol_min[1]
         x[:, 2] = x[:, 2] * self.vol_extent[2] + self.vol_min[2]
+
+        device = x.device
+        original_shape = x.shape[:-1]
+        x = x.reshape(-1, 3)
 
         x_np = x.detach().cpu().numpy().astype(np.float64)
         cluster_labels = self.kmeans.predict(x_np)
@@ -364,8 +364,8 @@ class UGINR(nn.Module):
             y[idx] = preds.to(device=device, dtype=y.dtype)
 
         y = y.reshape(*original_shape, 1)
-        # probe_mesh = pv.PolyData(x.cpu().numpy())
-        # probed = probe_mesh.sample(self.mesh)
-        # valid_mask = probed['vtkValidPointMask'].astype(bool)
-        # y[~valid_mask] = 0
+        probe_mesh = pv.PolyData(x.cpu().numpy())
+        probed = probe_mesh.sample(self.mesh)
+        valid_mask = probed['vtkValidPointMask'].astype(bool)
+        y[~valid_mask] = 0
         return y

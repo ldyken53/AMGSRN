@@ -23,7 +23,7 @@ class VEG(nn.Module):
         global_min = min(xmin, ymin, zmin)
         global_max = max(xmax, ymax, zmax)
         mesh.translate(np.array([-global_min, -global_min, -global_min]), inplace=True)
-        mesh.scale(1.0/(global_max - global_min), inplace=True)
+        mesh.scale(1.0 / (global_max - global_min), inplace=True)
         self.mesh = mesh
 
         plydata = PlyData.read(os.path.join(opt['path_to_load'], opt["ply_file"]))
@@ -39,9 +39,10 @@ class VEG(nn.Module):
             axis=1,
         )
         
-        self.vol_min = [xyz[:, 0].min(), xyz[:, 1].min(), xyz[:, 2].min()]
-        self.vol_max = [xyz[:, 0].max(), xyz[:, 1].max(), xyz[:, 2].max()]
-        self.vol_extent = [self.vol_max[0] - self.vol_min[0], self.vol_max[1] - self.vol_min[1], self.vol_max[2] - self.vol_min[2]]
+        xmin, xmax, ymin, ymax, zmin, zmax = mesh.bounds
+        self.vol_min = [xmin, ymin, zmin]
+        self.vol_max = [xmax, ymax, zmax]
+        self.vol_extent = [xmax - xmin, ymax - ymin, zmax - zmin]
         print(self.vol_min, self.vol_max)
 
         weights = np.asarray(plydata.elements[0]["weight"])[..., np.newaxis]

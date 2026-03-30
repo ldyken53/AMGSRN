@@ -18,7 +18,7 @@ class PV(nn.Module):
         super().__init__()
         self.opt = opt
 
-        mesh = pv.read(opt["mesh_file"])
+        mesh = pv.read(os.path.join(opt["path_to_load"], opt["mesh_file"]))
         xmin, xmax, ymin, ymax, zmin, zmax = mesh.bounds
         global_min = min(xmin, ymin, zmin)
         global_max = max(xmax, ymax, zmax)
@@ -75,5 +75,5 @@ class PV(nn.Module):
         y = probed[self.mesh.array_names[0]]
         valid_mask = probed['vtkValidPointMask'].astype(bool)
         y[~valid_mask] = 0
-        y = torch.from_numpy(y).to(x.device)
+        y = torch.from_numpy(y).float().to(x.device)
         return y.reshape(-1, 1)

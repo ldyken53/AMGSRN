@@ -2,8 +2,8 @@ import torch
 import torch.nn as nn
 import os
 import numpy as np
-from math import exp, log
 import pyvista as pv
+from math import exp, log
 from plyfile import PlyData, PlyElement
 from bvh_diff_gaussian_rasterization import (
     GaussianRasterizationSettings,
@@ -13,10 +13,18 @@ from bvh_diff_gaussian_rasterization import (
 def inverse_sigmoid(x):
     return torch.log(x / (1 - x))
 
-class VEGS(nn.Module):
+class VEG(nn.Module):
     def __init__(self, opt) -> None:
         super().__init__()
         self.opt = opt
+
+        mesh = pv.read(os.path.join(opt['path_to_load'], opt["mesh_file"]))
+        xmin, xmax, ymin, ymax, zmin, zmax = mesh.bounds
+        global_min = min(xmin, ymin, zmin)
+        global_max = max(xmax, ymax, zmax)
+        mesh.translate(np.array([-global_min, -global_min, -global_min]), inplace=True)
+        mesh.scale(1.0 / (global_max - global_min), inplace=True)
+        self.mesh = mesh
 
         plydata = PlyData.read(os.path.join(opt['path_to_load'], opt["ply_file"]))
         print(
@@ -30,27 +38,12 @@ class VEGS(nn.Module):
             ),
             axis=1,
         )
-
         
-        if opt.get("mesh_file"):
-            mesh = pv.read(os.path.join(opt['path_to_load'], opt["mesh_file"]))
-            xmin, xmax, ymin, ymax, zmin, zmax = mesh.bounds
-            global_min = min(xmin, ymin, zmin)
-            global_max = max(xmax, ymax, zmax)
-            mesh.translate(np.array([-global_min, -global_min, -global_min]), inplace=True)
-            mesh.scale(1.0 / (global_max - global_min), inplace=True)
-            self.mesh = mesh
-
-            xmin, xmax, ymin, ymax, zmin, zmax = mesh.bounds
-            self.vol_min = [xmin, ymin, zmin]
-            self.vol_max = [xmax, ymax, zmax]
-            self.vol_extent = [xmax - xmin, ymax - ymin, zmax - zmin]
-            print(self.vol_min, self.vol_max)
-        else:
-            self.vol_min = [xyz[:, 0].min(), xyz[:, 1].min(), xyz[:, 2].min()]
-            self.vol_max = [xyz[:, 0].max(), xyz[:, 1].max(), xyz[:, 2].max()]
-            self.vol_extent = [self.vol_max[0] - self.vol_min[0], self.vol_max[1] - self.vol_min[1], self.vol_max[2] - self.vol_min[2]]
-            print(self.vol_min, self.vol_max)
+        xmin, xmax, ymin, ymax, zmin, zmax = mesh.bounds
+        self.vol_min = [xmin, ymin, zmin]
+        self.vol_max = [xmax, ymax, zmax]
+        self.vol_extent = [xmax - xmin, ymax - ymin, zmax - zmin]
+        print(self.vol_min, self.vol_max)
 
         weights = np.asarray(plydata.elements[0]["weight"])[..., np.newaxis]
 
@@ -73,7 +66,7 @@ class VEGS(nn.Module):
             rots[:, idx] = np.asarray(plydata.elements[0][attr_name])
 
         values = np.asarray(plydata.elements[0]["value"])[..., np.newaxis]
-
+       
         xyz_t = torch.tensor(xyz, dtype=torch.float, device="cuda")
         weight_t = torch.tensor(weights, dtype=torch.float, device="cuda")
         scaling_t = torch.tensor(scales, dtype=torch.float, device="cuda")
@@ -146,7 +139,44 @@ class VEGS(nn.Module):
         self.rotation_activation = torch.nn.functional.normalize
 
         self.max_scale = 0.02
-    
+
+        # --- Precompute validity mask on the full grid (one-time cost) ---
+        # full_shape is [Nz, Ny, Nx]
+        fs = opt['full_shape']
+        self._grid_shape = (int(fs[0]), int(fs[1]), int(fs[2]))
+        Nz, Ny, Nx = self._grid_shape
+
+        print(f"Precomputing validity mask on grid {Nz}x{Ny}x{Nx} ...")
+
+        # Build the full grid in volume coordinates, matching forward()'s mapping:
+        #   col 0 (x-coord) uses vol_extent[0], col 1 (y) uses [1], col 2 (z) uses [2]
+        # full_shape dim ordering: [z, y, x]
+        x_lin = np.linspace(0, 1, Nx, dtype=np.float32) * self.vol_extent[0] + self.vol_min[0]
+        y_lin = np.linspace(0, 1, Ny, dtype=np.float32) * self.vol_extent[1] + self.vol_min[1]
+        z_lin = np.linspace(0, 1, Nz, dtype=np.float32) * self.vol_extent[2] + self.vol_min[2]
+
+        # meshgrid with indexing='ij' gives shape [Nz, Ny, Nx] for each
+        zz, yy, xx = np.meshgrid(z_lin, y_lin, x_lin, indexing='ij')
+        grid_pts = np.stack([xx.ravel(), yy.ravel(), zz.ravel()], axis=1)
+
+        # Probe the mesh in chunks to limit peak memory
+        chunk_size = 2_000_000
+        n_pts = grid_pts.shape[0]
+        mask_full = np.empty(n_pts, dtype=bool)
+        for start in range(0, n_pts, chunk_size):
+            end = min(start + chunk_size, n_pts)
+            probe_mesh = pv.PolyData(grid_pts[start:end])
+            probed = probe_mesh.sample(self.mesh)
+            mask_full[start:end] = probed['vtkValidPointMask'].astype(bool)
+
+        # Store as a flat bool tensor on GPU. Flat index = iz*Ny*Nx + iy*Nx + ix
+        self.register_buffer(
+            "_valid_mask",
+            torch.tensor(mask_full, dtype=torch.bool, device="cuda"),
+            persistent=False,
+        )
+        print(f"Validity mask precomputed: {mask_full.sum()}/{n_pts} valid points")
+
     def _apply_cap(self, s):
         r = torch.linalg.norm(s, dim=1, keepdim=True) + 1e-8
         r_soft = self.max_scale * torch.tanh(r / self.max_scale)
@@ -198,11 +228,27 @@ class VEGS(nn.Module):
         ]
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = (x + 1) / 2
-        x[:, 0] = x[:, 0] * self.vol_extent[0] + self.vol_min[0]
-        x[:, 1] = x[:, 1] * self.vol_extent[1] + self.vol_min[1]
-        x[:, 2] = x[:, 2] * self.vol_extent[2] + self.vol_min[2]
-        
+        Nz, Ny, Nx = self._grid_shape
+
+        # Map from [-1, 1] to grid indices (entirely on GPU, no CPU roundtrip)
+        x01 = (x + 1.0) * 0.5  # [-1,1] -> [0,1]
+        ix = (x01[:, 0] * (Nx - 1)).round().long()
+        iy = (x01[:, 1] * (Ny - 1)).round().long()
+        iz = (x01[:, 2] * (Nz - 1)).round().long()
+
+        # Clamp to valid range (handles floating point edge cases)
+        ix = ix.clamp(0, Nx - 1)
+        iy = iy.clamp(0, Ny - 1)
+        iz = iz.clamp(0, Nz - 1)
+
+        flat_idx = iz * (Ny * Nx) + iy * Nx + ix
+        valid_mask = self._valid_mask[flat_idx]
+
+        # Transform x to volume coordinates for the rasterizer
+        x[:, 0] = x01[:, 0] * self.vol_extent[0] + self.vol_min[0]
+        x[:, 1] = x01[:, 1] * self.vol_extent[1] + self.vol_min[1]
+        x[:, 2] = x01[:, 2] * self.vol_extent[2] + self.vol_min[2]
+
         self._rasterizer.build_bvh(x, False, False)
         means3D = self.get_xyz
         scales = self.get_scaling
@@ -218,5 +264,5 @@ class VEGS(nn.Module):
             weights=weights,
             debug=False
         )
-        y = y.reshape(-1, 1)
-        return y
+        y[~valid_mask] = 0
+        return y.reshape(-1, 1)
