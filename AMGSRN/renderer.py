@@ -10,6 +10,7 @@ import time
 import torch.nn.functional as F
 from typing import List, Tuple
 from math import ceil
+import json
 
 def sync_time():
     torch.cuda.synchronize()
@@ -36,6 +37,53 @@ def imgs_to_video_imageio(save_location, stacked_imgs, fps=10):
     import imageio.v3 as imageio
     imageio.imwrite(save_location, stacked_imgs,
                     extension=".mp4", fps=fps)
+
+def deserialize_camera_state(state):
+    """Convert a serialized camera state dict back to native types."""
+    restored = {}
+    for key, val in state.items():
+        if isinstance(val, dict) and val.get("__ndarray__"):
+            restored[key] = np.array(val["data"], dtype=val["dtype"])
+        else:
+            restored[key] = val
+    return restored
+
+def load_arcball_camera_from_state(state_path, scene_aabb, coi, dist, fov=60.0):
+    """Load a camera state JSON (saved by renderer_app) and return an Arcball camera.
+    
+    The saved state comes from an Arcball camera, so we must use the same class
+    to restore it — the torch-based Camera class has an incompatible internal
+    representation (azi/polar vs quaternion rotation).
+    """
+    from AMGSRN.UI.utils import Arcball
+
+    with open(state_path, 'r') as f:
+        raw_state = json.load(f)
+    state = deserialize_camera_state(raw_state)
+
+    # Create an Arcball with the same defaults the app uses
+    camera = Arcball(
+        scene_aabb=scene_aabb,
+        coi=coi,
+        dist=dist,
+        fov=fov
+    )
+
+    # Apply saved state (same logic as renderer_app's do_load_camera_state)
+    skip_keys = {
+        'camera_dirs', 'mouse_start', 'mouse_curr',
+        'width', 'height', 'resolution',
+    }
+    for key, val in state.items():
+        if key in skip_keys:
+            continue
+        if hasattr(camera, key):
+            setattr(camera, key, val)
+        else:
+            print(f"Warning: camera has no attribute '{key}', skipping")
+
+    print(f"Camera state loaded from {state_path}")
+    return camera
 
 class RawData(torch.nn.Module):
     def __init__(self, data_name, device):
@@ -421,7 +469,7 @@ class Scene(torch.nn.Module):
         self.camera = camera
         self.background_color = torch.tensor([1.0, 1.0, 1.0], dtype=torch.float32, device=self.device)
         self.use_density = False
-        self.use_shading = True
+        self.use_shading = False
         # Lighting parameters
         self.ambient = 0.3
         self.diffuse_strength = 0.7
@@ -900,6 +948,13 @@ if __name__ == '__main__':
         type=str,
         help="The path to the ground truth image."
     )
+    parser.add_argument(
+        '--camera',
+        default=None,
+        type=str,
+        help="Path to a camera state JSON file (saved from the renderer app). "
+             "Overrides --azi, --polar, --dist when provided."
+    )
     
     
     # rendering args ********* <-
@@ -922,7 +977,7 @@ if __name__ == '__main__':
         model = load_model(opt, args['data_device'])
         model = model.to(opt['data_device'])
         model.set_default_timestep(args['timestep'])
-        full_shape = opt['full_shape']
+        full_shape = model.get_volume_extents()
         model.eval()
     else:
         model = RawData(args['load_from'], args['data_device'])
@@ -944,14 +999,29 @@ if __name__ == '__main__':
                         full_shape[2]-1])
     if(args['dist'] is None):
         args['dist'] = (aabb[3]**2 + aabb[4]**2 + aabb[5]**2)**0.5
-    camera = Camera(
-        device,
-        scene_aabb=aabb,
-        coi=aabb.reshape(2,3).mean(dim=0).flip(0), # camera lookat center of aabb,
-        azi_deg=args['azi'],
-        polar_deg=args['polar'],
-        dist=args['dist']
-    )
+
+    if args['camera'] is not None:
+        # Use the same Arcball class that the renderer app uses, since the
+        # saved state was serialized from an Arcball instance.
+        aabb_np = np.array([0.0, 0.0, 0.0,
+                            full_shape[0]-1,
+                            full_shape[1]-1,
+                            full_shape[2]-1], dtype=np.float32)
+        coi_np = np.array([aabb_np[5]/2, aabb_np[4]/2, aabb_np[3]/2],
+                          dtype=np.float32)
+        dist_default = float((aabb_np[3]**2 + aabb_np[4]**2 + aabb_np[5]**2)**0.5)
+        camera = load_arcball_camera_from_state(
+            args['camera'], aabb_np, coi_np, dist_default, fov=60.0
+        )
+    else:
+        camera = Camera(
+            device,
+            scene_aabb=aabb,
+            coi=aabb.reshape(2,3).mean(dim=0).flip(0), # camera lookat center of aabb,
+            azi_deg=args['azi'],
+            polar_deg=args['polar'],
+            dist=args['dist']
+        )
         
     scene = Scene(model, camera, full_shape, args['hw'], 
                   batch_size, args['spp'], tf, device, 
