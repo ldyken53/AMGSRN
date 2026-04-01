@@ -539,7 +539,7 @@ class Scene(torch.nn.Module):
         rgbs, alphas = self.transfer_function.color_opacity_at_value(densities[:, 0])
 
         if self.use_shading:
-            mask = alphas[:, 0] > 0.01
+            mask = alphas[:, 0] > 0.001
             if mask.any():
                 masked_locs = sample_locs[mask].to(self.data_device)
                 gradients = self.compute_gradient(masked_locs, eps=0.01).to(self.device)
@@ -1013,6 +1013,7 @@ if __name__ == '__main__':
         camera = load_arcball_camera_from_state(
             args['camera'], aabb_np, coi_np, dist_default, fov=60.0
         )
+        camera.resize(args['hw'][1], args['hw'][0])
     else:
         camera = Camera(
             device,
