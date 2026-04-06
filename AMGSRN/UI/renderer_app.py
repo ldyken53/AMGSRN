@@ -84,7 +84,7 @@ class TransferFunctionEditor(pg.GraphItem):
         self.parent = parent
         pg.GraphItem.__init__(self)
 
-    def setData(self, **kwds):
+    def setData(self, convert_to_log=True, **kwds):
         '''
         Assumes kwds['pos'] is a pre-sorted lists of tuples of control point -> opacity
         sorted by control point value. I.e.
@@ -102,7 +102,8 @@ class TransferFunctionEditor(pg.GraphItem):
             # Clip opacity between 0 and 1
             self.data['pos'][:,1] = np.clip(self.data['pos'][:,1], 0.0, 1.0)
             # Convert Y to log display space
-            self.data['pos'][:,1] = linear_to_log(self.data['pos'][:,1])
+            if convert_to_log:
+                self.data['pos'][:,1] = linear_to_log(self.data['pos'][:,1])
             self.data['adj'] = np.column_stack((np.arange(0, npts-1), np.arange(1, npts)))
             self.data['data'] = np.empty(npts, dtype=[('index', int)])
             self.data['data']['index'] = np.arange(npts)
@@ -128,7 +129,7 @@ class TransferFunctionEditor(pg.GraphItem):
                 axis=0
             )
             self.data['pos'] = new_pos
-            self.setData(**self.data)
+            self.setData(convert_to_log=False, **self.data)
             self.lastDragPointIndex -= 1
         
     def mouseDragEvent(self, ev):
@@ -198,7 +199,7 @@ class TransferFunctionEditor(pg.GraphItem):
                 axis=0
             )
             self.data['pos'] = new_pos
-            self.setData(**self.data)
+            self.setData(convert_to_log=False, **self.data)
             self.lastDragPointIndex = ind
                 
 class MainWindow(QMainWindow):
@@ -230,7 +231,8 @@ class MainWindow(QMainWindow):
         
         # Render area
         self.render_view = QLabel()   
-        self.render_view.setMaximumWidth(1335)
+        # self.render_view.setMaximumWidth(1024)
+        # self.render_view.setMaximumWidth(1024)
         self.render_view.mousePressEvent = self.mouseClicked
         self.render_view.mouseReleaseEvent = self.mouseReleased
         self.render_view.mouseMoveEvent = self.mouseMove   
@@ -300,6 +302,12 @@ class MainWindow(QMainWindow):
         self.load_camera_button.clicked.connect(self.load_camera)
         self.camera_io_box.addWidget(self.load_camera_button)
         # === End camera save/load buttons ===
+
+        # === Aspect ratio lock ===
+        self.lock_aspect_checkbox = QCheckBox("Lock 16:9 aspect ratio (for 4K renders)")
+        self.lock_aspect_checkbox.setChecked(False)
+        self.lock_aspect_checkbox.stateChanged.connect(self.apply_aspect_lock)
+        # === End aspect ratio lock ===
 
         # === Lighting controls ===
         self.lighting_group = QGroupBox("Lighting")
@@ -480,6 +488,13 @@ class MainWindow(QMainWindow):
         self.transfer_function_box.addWidget(win)
         #self.transfer_function_box.addWidget(x_axis)
         #self.transfer_function_box.addWidget(y_axis)
+
+        # === Save Colormap button ===
+        self.save_colormap_button = QPushButton("Save Colormap")
+        self.save_colormap_button.setFixedHeight(25)
+        self.save_colormap_button.clicked.connect(self.save_colormap)
+        self.transfer_function_box.addWidget(self.save_colormap_button)
+        # === End Save Colormap button ===
         
                         
         self.status_text = QLabel("") 
@@ -501,14 +516,15 @@ class MainWindow(QMainWindow):
         self.settings_ui.addLayout(self.batch_slider_box)
         self.settings_ui.addLayout(self.spp_slider_box)
         self.settings_ui.addWidget(self.view_xy_button)
-        self.settings_ui.addWidget(self.density_toggle)
+        # self.settings_ui.addWidget(self.density_toggle)
         self.settings_ui.addLayout(self.camera_io_box)
+        self.settings_ui.addWidget(self.lock_aspect_checkbox)
         self.settings_ui.addWidget(self.lighting_group)
         self.settings_ui.addLayout(self.transfer_function_box)
         self.settings_ui.addLayout(self.tf_rescale_slider_box)
         self.settings_ui.addLayout(self.timestep_selector_box)
-        self.settings_ui.addStretch()
-        self.settings_ui.addWidget(self.status_text)
+        # self.settings_ui.addStretch()
+        # self.settings_ui.addWidget(self.status_text)
         self.settings_ui.addWidget(self.memory_use_label)
         self.settings_ui.addWidget(self.update_framerate_label)
         self.settings_ui.addWidget(self.frame_time_label)
@@ -612,6 +628,67 @@ class MainWindow(QMainWindow):
         print(f"Camera loaded from {filepath}")
         self.status_text_update.emit(f"Camera loaded from {os.path.basename(filepath)}")
 
+    def save_colormap(self):
+        """Save the current color + opacity map as a ParaView-style JSON file."""
+        filepath, _ = QFileDialog.getSaveFileName(
+            self, "Save Colormap", "", "JSON Files (*.json);;All Files (*)"
+        )
+        if not filepath:
+            return
+        if not filepath.endswith(".json"):
+            filepath += ".json"
+
+        name = os.path.splitext(os.path.basename(filepath))[0]
+
+        # --- Opacity from the TF editor (normalized 0-1) ---
+        if 'pos' not in self.tf_editor.data:
+            self.status_text_update.emit("No opacity data to save")
+            return
+        opacity_pos = self.tf_editor.data['pos'].copy()
+        opacity_x = opacity_pos[:, 0]                 # control-point scalars in [0,1]
+        opacity_y = log_to_linear(opacity_pos[:, 1])   # convert display-log back to linear
+
+        # Build Points array: [scalar, opacity, midpoint, sharpness] per control point
+        points = []
+        for x, y in zip(opacity_x, opacity_y):
+            points.extend([float(x), float(y), 0.5, 0.0])
+
+        # --- Color from the currently-loaded colormap file ---
+        current_tf_name = self.tfs_dropdown.currentText()
+        tf_path = os.path.join(tf_folder, current_tf_name)
+        rgb_points = []
+        try:
+            with open(tf_path, 'r') as f:
+                tf_data = json.load(f)
+            src = tf_data[0] if isinstance(tf_data, list) else tf_data
+            raw = src.get('RGBPoints', [])
+            # Normalise the scalar channel to [0,1] so it matches the opacity
+            if len(raw) >= 8:                        # at least 2 colour stops
+                scalars = raw[0::4]
+                s_min, s_max = scalars[0], scalars[-1]
+                rng = s_max - s_min if s_max != s_min else 1.0
+                rgb_points = list(raw)                # copy
+                for i in range(0, len(rgb_points), 4):
+                    rgb_points[i] = (rgb_points[i] - s_min) / rng
+            else:
+                rgb_points = list(raw)
+        except Exception as e:
+            print(f"Warning: could not read colormap file: {e}")
+            rgb_points = [0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0]
+
+        output = [{
+            "ColorSpace": "RGB",
+            "Name": name,
+            "Points": points,
+            "RGBPoints": rgb_points
+        }]
+
+        with open(filepath, 'w') as f:
+            json.dump(output, f, indent='\t')
+
+        print(f"Colormap saved to {filepath}")
+        self.status_text_update.emit(f"Colormap saved to {os.path.basename(filepath)}")
+
     def save_img(self):
         folderpath,_ = QFileDialog.getSaveFileName(self, 'Select Save Location')
         if ".jpg" not in folderpath and ".png" not in folderpath:
@@ -677,11 +754,21 @@ class MainWindow(QMainWindow):
         self.render_worker.finished.connect(self.render_worker.deleteLater)
         self.render_thread.finished.connect(self.render_worker.deleteLater)
     
+    def apply_aspect_lock(self):
+        self.resizeEvent(None)
+
     def resizeEvent(self, event):
         w = self.render_view.frameGeometry().width()
         h = self.render_view.frameGeometry().height()
-        self.render_worker.resize.emit(w,h)
-        QMainWindow.resizeEvent(self, event)
+        if self.lock_aspect_checkbox.isChecked():
+            target = 16 / 9
+            if w / h > target:
+                w = int(h * target)
+            else:
+                h = int(w / target)
+        self.render_worker.resize.emit(w, h)
+        if event is not None:
+            QMainWindow.resizeEvent(self, event)
      
     def mouseClicked(self, event):
         if event.type() == QEvent.MouseButtonPress:
@@ -848,12 +935,13 @@ class MainWindow(QMainWindow):
         scroll = event.angleDelta().y()/120
         self.render_worker.zoom.emit(-scroll)
          
-    def set_render_image(self, img:np.ndarray):  
+    def set_render_image(self, img: np.ndarray):
         height, width, channel = img.shape
         self.last_img = img
         bytesPerLine = channel * width
         qImg = QImage(img, width, height, bytesPerLine, QImage.Format_RGB888)
-        self.render_view.setPixmap(QPixmap(qImg))
+        pixmap = QPixmap(qImg)
+        self.render_view.setPixmap(pixmap.scaled(self.render_view.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
         
 class RendererThread(QObject):
     progress = pyqtSignal(np.ndarray)
