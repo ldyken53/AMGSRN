@@ -19,11 +19,12 @@ class VEG(nn.Module):
         self.opt = opt
 
         mesh = pv.read(os.path.join(opt['path_to_load'], opt["mesh_file"]))
-        xmin, xmax, ymin, ymax, zmin, zmax = mesh.bounds
-        global_min = min(xmin, ymin, zmin)
-        global_max = max(xmax, ymax, zmax)
-        mesh.translate(np.array([-global_min, -global_min, -global_min]), inplace=True)
-        mesh.scale(1.0 / (global_max - global_min), inplace=True)
+        if not opt.get("scaled_mesh"):
+            xmin, xmax, ymin, ymax, zmin, zmax = mesh.bounds
+            global_min = min(xmin, ymin, zmin)
+            global_max = max(xmax, ymax, zmax)
+            mesh.translate(np.array([-global_min, -global_min, -global_min]), inplace=True)
+            mesh.scale(1.0 / (global_max - global_min), inplace=True)
         self.mesh = mesh
 
         plydata = PlyData.read(os.path.join(opt['path_to_load'], opt["ply_file"]))
